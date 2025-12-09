@@ -125,6 +125,7 @@ def load_data_from_uploads(uploaded_files):
     dfs = []
     for f in uploaded_files:
         try:
+            f.seek(0)
             t = pd.read_csv(f)
             # Use filename as experiment name if not present
             if "experiment" not in t.columns:
@@ -134,12 +135,8 @@ def load_data_from_uploads(uploaded_files):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 def preprocess_data(df_in):
-    if df_in.empty: return None, None, None
+    if df_in.empty: return None, []
     df = df_in.copy()
-
-    # Filter Columns
-    available_cols = [c for c in COLUMNS_TO_KEEP if c in df.columns]
-    df = df[available_cols]
 
     # Imputation
     if "dist_to_nearest_gfp" in df.columns:
@@ -147,48 +144,53 @@ def preprocess_data(df_in):
         df["dist_to_nearest_gfp"] = df["dist_to_nearest_gfp"].replace([np.inf, -np.inf], 1500.0)
 
     # Determine Numeric Columns
+    # We use all potential numeric columns
     potential_pca_cols = [c for c in df.columns if c not in PCA_EXCLUDE_COLS]
-    pca_numeric_cols = []
+    numeric_cols = []
     for c in potential_pca_cols:
         df[c] = pd.to_numeric(df[c], errors='coerce')
         if pd.api.types.is_numeric_dtype(df[c]):
-             pca_numeric_cols.append(c)
+             numeric_cols.append(c)
              
-    if not pca_numeric_cols:
+    if not numeric_cols:
         st.error(f"No numeric columns found.")
-        return None, None, None
+        return None, []
 
     # Handle Inf -> NaN
-    df[pca_numeric_cols] = df[pca_numeric_cols].replace([np.inf, -np.inf], np.nan)
+    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
     
-    # Drop Missing
-    df_clean = df.dropna(subset=pca_numeric_cols).reset_index(drop=True)
-    
-    if df_clean.empty:
-        st.error("Dropping missing values resulted in 0 rows.")
-        return None, None, None
-
-    # Extract & Standardize
-    features = df_clean[pca_numeric_cols].values
-    
-    selector = VarianceThreshold(threshold=0.0)
-    try:
-        features = selector.fit_transform(features)
-        # Get support to know which columns remained
-        support = selector.get_support()
-        remaining_cols = [c for c, keep in zip(pca_numeric_cols, support) if keep]
-    except ValueError:
-        st.error("All features have zero variance.")
-        return None, None, None
-
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-    
-    return df_clean, features_scaled, remaining_cols
+    return df, numeric_cols
 
 # -----------------------------------------------------------------------------
 # 4. Visualization (Bokeh)
 # -----------------------------------------------------------------------------
+
+def prepare_features(df, cols_to_use):
+    """
+    Helper to subset, dropna, and scale features for a specific analysis.
+    Returns: df_clean, features_scaled
+    """
+    # 1. Subset
+    df_sub = df.dropna(subset=cols_to_use).reset_index(drop=True)
+    
+    if df_sub.empty:
+        return None, None
+        
+    # 2. Extract
+    features = df_sub[cols_to_use].values
+    
+    # 3. Variance Filter
+    selector = VarianceThreshold(threshold=0.0)
+    try:
+        features = selector.fit_transform(features)
+    except ValueError:
+        return None, None # All zero variance
+
+    # 4. Scale
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    return df_sub, features_scaled
 
 def bokeh_plot(df, x_col, y_col, color_col):
     def get_url(row):
@@ -287,12 +289,24 @@ def bokeh_plot(df, x_col, y_col, color_col):
 # 5. Main App
 # -----------------------------------------------------------------------------
 
-def umap_dbscan_tab(df_clean, feats):
+def umap_dbscan_tab(df_full, numeric_cols):
     st.markdown("### UMAP & DBSCAN")
     
-    # Store local PCA for this tab if regular PCA tab hasn't run global settings? 
-    # Actually, let's keep share PCA if possible, or re-run.
-    # The existing code ran PCA then DBSCAN/UMAP.
+    # Default columns logic for UMAP tab
+    # We try to use COLUMNS_TO_KEEP that are actually in the df
+    default_cols = [c for c in COLUMNS_TO_KEEP if c in df_full.columns and c in numeric_cols]
+    
+    # If this default processing hasn't been done or cached, do it
+    if "umap_feats" not in st.session_state or st.session_state.umap_feats is None:
+         df_clean, feats = prepare_features(df_full, default_cols)
+         if df_clean is None:
+             st.error("Preprocessing for UMAP failed (0 rows after dropping NaN in default columns).")
+             return
+         st.session_state.umap_df = df_clean
+         st.session_state.umap_feats = feats
+    
+    df_clean = st.session_state.umap_df
+    feats = st.session_state.umap_feats
     
     c1, c2, c3 = st.columns(3)
     
@@ -312,7 +326,7 @@ def umap_dbscan_tab(df_clean, feats):
         if st.button("Run DBSCAN", key="btn_dbscan"):
             if st.session_state.pca_res is not None:
                 lbls = DBSCAN(eps=eps, min_samples=10).fit_predict(st.session_state.pca_res)
-                st.session_state.df_clean["DBSCAN"] = [str(l) if l!=-1 else "Noise" for l in lbls]
+                st.session_state.umap_df["DBSCAN"] = [str(l) if l!=-1 else "Noise" for l in lbls]
                 st.session_state.dbscan_done = True
                 st.rerun()
             else:
@@ -334,35 +348,59 @@ def umap_dbscan_tab(df_clean, feats):
     if st.session_state.umap_res is not None:
         st.divider()
         coords = st.session_state.umap_res
-        st.session_state.df_clean["UMAP1"] = coords[:, 0]
-        st.session_state.df_clean["UMAP2"] = coords[:, 1]
+        st.session_state.umap_df["UMAP1"] = coords[:, 0]
+        st.session_state.umap_df["UMAP2"] = coords[:, 1]
         
         # Color Options
         opts = ["experiment"]
         if st.session_state.get("dbscan_done"): opts.insert(0, "DBSCAN")
         
-        numeric_cols = [c for c in df_clean.columns if pd.api.types.is_numeric_dtype(df_clean[c])]
+        # Use columns from clean df
+        viz_cols = [c for c in df_clean.columns if pd.api.types.is_numeric_dtype(df_clean[c])]
         exclude_viz = ["UMAP1", "UMAP2", "crop_path", "crop_zip"]
-        opts += [c for c in numeric_cols if c not in exclude_viz]
+        opts += [c for c in viz_cols if c not in exclude_viz]
         
         c_mode = st.selectbox("Color by:", opts, key="sel_color")
-        
-        st.bokeh_chart(bokeh_plot(st.session_state.df_clean, "UMAP1", "UMAP2", c_mode), use_container_width=True)
+        st.bokeh_chart(bokeh_plot(st.session_state.umap_df, "UMAP1", "UMAP2", c_mode), use_container_width=True)
 
-def pca_exploration_tab(df_clean, feats, numeric_col_names):
+
+def pca_exploration_tab(df_full, numeric_col_names):
     st.markdown("### PCA Exploration")
     
+    # Feature Selection
+    sel_features = st.multiselect(
+        "Select Features for PCA:", 
+        options=numeric_col_names, 
+        default=numeric_col_names[:10], # Default to first 10 to be safe? Or just all? User wanted default.
+        key="pca_feat_sel"
+    )
+    
     if st.button("Run Analysis", key="btn_run_pca_exp"):
+        if not sel_features:
+            st.error("Please select at least one feature.")
+            return
+
+        # Prepare data LOCALLY for this tab
+        df_pca, feats_sub = prepare_features(df_full, sel_features)
+        
+        if df_pca is None or len(df_pca) == 0:
+            st.error("Dropped all rows after selecting these features (too many missing values?).")
+            return
+            
         # Full PCA
         pca = PCA() # Full components
-        pca.fit(feats)
+        pca.fit(feats_sub)
         
         st.session_state.pca_exp_model = pca
-        st.session_state.pca_exp_feats = feats
+        st.session_state.pca_exp_feats = feats_sub
+        st.session_state.pca_exp_feat_names = sel_features
+        st.session_state.pca_exp_df = df_pca # Need this for plotting (matching indices)
     
     if "pca_exp_model" in st.session_state:
         pca = st.session_state.pca_exp_model
         feats_scaled = st.session_state.pca_exp_feats
+        current_feat_names = st.session_state.get("pca_exp_feat_names", numeric_col_names)
+        df_viz = st.session_state.get("pca_exp_df", df_full) # Fallback? No, should be there
         
         # 1. Variance Explained
         st.subheader("1. Variance Explained")
@@ -405,15 +443,15 @@ def pca_exploration_tab(df_clean, feats, numeric_col_names):
         x_pc = c_x.number_input("X Axis (PC)", 1, n_pcs, 1, key="pc_x")
         y_pc = c_y.number_input("Y Axis (PC)", 1, n_pcs, 2, key="pc_y")
         
-        # Options for color
-        opts = ["experiment"] + numeric_col_names
+        # Options for color - use columns from df_viz
+        opts = ["experiment"] + [c for c in df_viz.columns if pd.api.types.is_numeric_dtype(df_viz[c])]
         color_by_pc = c_col.selectbox("Color By", opts, key="pc_color_by")
         
         # Create temp DF for plotting
         plot_df = pd.DataFrame({
             "x": pcs_coords[:, x_pc-1],
             "y": pcs_coords[:, y_pc-1],
-            "color": df_clean[color_by_pc] if color_by_pc in df_clean.columns else np.zeros(len(df_clean))
+            "color": df_viz[color_by_pc] if color_by_pc in df_viz.columns else np.zeros(len(df_viz))
         })
         
         fig, ax = plt.subplots(figsize=(8,6))
@@ -431,24 +469,29 @@ def pca_exploration_tab(df_clean, feats, numeric_col_names):
         # 3. Loadings
         st.subheader("3. Feature Loadings (Top contributors)")
         
-        loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{i+1}" for i in range(n_pcs)], index=numeric_col_names)
-        
-        target_pc = st.selectbox("Select PC to inspect loadings", [f"PC{i+1}" for i in range(min(10, n_pcs))], key="sel_loadings_pc")
-        
-        n_top = 10
-        pc_loadings = loadings[target_pc].abs().sort_values(ascending=False).head(n_top)
-        top_feats = pc_loadings.index
-        
-        # Get actual signed values for plotting
-        plot_loadings = loadings.loc[top_feats, target_pc]
-        
-        fig, ax = plt.subplots(figsize=(8, 5))
-        colors = ['blue' if x > 0 else 'red' for x in plot_loadings]
-        plot_loadings.plot(kind='barh', ax=ax, color=colors)
-        ax.set_title(f"Top {n_top} Loadings for {target_pc}")
-        ax.set_xlabel("Loading Value")
-        st.pyplot(fig)
-        
+        try:
+            loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{i+1}" for i in range(n_pcs)], index=current_feat_names)
+            
+            target_pc = st.selectbox("Select PC to inspect loadings", [f"PC{i+1}" for i in range(min(10, n_pcs))], key="sel_loadings_pc")
+            
+            n_top = 10
+            pc_loadings = loadings[target_pc].abs().sort_values(ascending=False).head(n_top)
+            top_feats = pc_loadings.index
+            
+            # Get actual signed values for plotting
+            plot_loadings = loadings.loc[top_feats, target_pc]
+            
+            fig, ax = plt.subplots(figsize=(8, 5))
+            colors = ['blue' if x > 0 else 'red' for x in plot_loadings]
+            plot_loadings.plot(kind='barh', ax=ax, color=colors)
+            ax.set_title(f"Top {n_top} Loadings for {target_pc}")
+            ax.set_xlabel("Loading Value")
+            st.pyplot(fig)
+        except Exception as e:
+            st.error(f"Error plotting loadings: {e}")
+            import traceback
+            st.text(traceback.format_exc())
+            
         # 4. KMeans / Elbow for Clusters
         st.subheader("4. Optimal Cluster Number (K-Means)")
         
@@ -503,29 +546,36 @@ def main():
         data_folder = st.sidebar.text_input("Data Folder", value=default_path)
         st.session_state.data_folder = data_folder # Store for image server
         
-        if st.sidebar.button("Load Folder", key="btn_load_folder") or ("df_raw" in st.session_state and st.session_state.get("data_source_mode") == "Folder"):
+        if st.sidebar.button("Load Folder", key="btn_load_folder"):
             st.session_state.df_raw = load_data_from_folder(data_folder)
             st.session_state.data_source_mode = "Folder"
-            
-            # Reset only if changing source, but here we just re-load. 
-            # If re-load is pressed, we might want to clear old results.
-            if st.session_state.get("last_loaded_folder") != data_folder:
-                 st.session_state.pca_res = None
-                 st.session_state.umap_res = None
-                 st.session_state.sel_hash = None
-                 st.session_state.last_loaded_folder = data_folder
+            st.session_state.pca_res = None
+            st.session_state.umap_res = None
+            st.session_state.sel_hash = None
+            st.session_state.last_loaded_folder = data_folder
+            # Clear ext PCA model if data changes
+            if "pca_exp_model" in st.session_state: del st.session_state.pca_exp_model
+            # Clear UMAP cache
+            if "umap_feats" in st.session_state: del st.session_state.umap_feats
+            st.rerun() 
             
     else: # Upload
         uploaded_files = st.sidebar.file_uploader("Upload CSVs", type="csv", accept_multiple_files=True)
         st.session_state.data_folder = "" 
         
         if uploaded_files:
-            if st.sidebar.button("Load Files", key="btn_load_files") or ("df_raw" in st.session_state and st.session_state.get("data_source_mode") == "Upload"):
+            # Only load if button clicked
+            if st.sidebar.button("Load Files", key="btn_load_files"):
                 st.session_state.df_raw = load_data_from_uploads(uploaded_files)
                 st.session_state.data_source_mode = "Upload"
                 st.session_state.pca_res = None
                 st.session_state.umap_res = None
                 st.session_state.sel_hash = None
+                # Clear ext PCA model if data changes
+                if "pca_exp_model" in st.session_state: del st.session_state.pca_exp_model
+                 # Clear UMAP cache
+                if "umap_feats" in st.session_state: del st.session_state.umap_feats
+                st.rerun() 
 
     if "df_raw" not in st.session_state or st.session_state.df_raw.empty:
         st.info("Please load data to begin.")
@@ -537,39 +587,38 @@ def main():
     
     if not sel_exps: return
 
-    # Processing
-    curr_hash = hash(tuple(sel_exps))
-    if st.session_state.sel_hash != curr_hash:
+    # Processing - Now strictly mostly light-weight
+    curr_hash = hash(tuple(sorted(sel_exps)))
+    if st.session_state.get("sel_hash") != curr_hash: 
         with st.spinner("Preprocessing..."):
             subset = st.session_state.df_raw[st.session_state.df_raw["experiment"].isin(sel_exps)]
-            df_clean, feats, numeric_cols = preprocess_data(subset)
+            df_full_processed, numeric_cols = preprocess_data(subset)
             
-            st.session_state.df_clean = df_clean
-            st.session_state.feats = feats
+            st.session_state.df_full_processed = df_full_processed
             st.session_state.numeric_cols = numeric_cols
             st.session_state.sel_hash = curr_hash
-            st.session_state.pca_res = None
-            st.session_state.umap_res = None
-            st.session_state.dbscan_done = False
+            
+            # Reset Tab 1 (UMAP) cache since data changed
+            st.session_state.umap_feats = None
+            
             # Clear ext PCA model if data changes
             if "pca_exp_model" in st.session_state: del st.session_state.pca_exp_model
 
-    df_clean = st.session_state.df_clean
-    feats = st.session_state.feats
-    numeric_cols = st.session_state.numeric_cols
+    df_full = st.session_state.get("df_full_processed")
+    numeric_cols = st.session_state.get("numeric_cols")
     
-    if df_clean is None: return 
+    if df_full is None: return 
 
-    st.sidebar.success(f"Ready: {len(df_clean)} objects | {feats.shape[1]} features")
+    st.sidebar.success(f"Ready: {len(df_full)} objects (Total) | {len(numeric_cols)} numeric cols")
 
     # TABS
     tab1, tab2 = st.tabs(["UMAP & DBSCAN", "PCA Exploration"])
     
     with tab1:
-        umap_dbscan_tab(df_clean, feats)
+        umap_dbscan_tab(df_full, numeric_cols)
         
     with tab2:
-        pca_exploration_tab(df_clean, feats, numeric_cols)
+        pca_exploration_tab(df_full, numeric_cols)
 
 if __name__ == "__main__":
     main()
