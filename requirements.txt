@@ -6,3 +6,4 @@ umap-learn
 bokeh
 matplotlib
 seaborn
+streamlit-bokeh
